@@ -147,8 +147,9 @@ oo::class create ::rmq::Channel {
 
 			# invoke the callback
 			if {$lastBasicMethod eq "deliver"} {
+				::rmq::debug "Invoking expanded callback"    
 				set cTag [dict get [lindex $consumerCBArgs 0] consumerTag]
-				after idle [list after 0 [list $consumerCBs($cTag) [self] {*}$consumerCBArgs]]
+				after idle [list after 0 [list {*}$consumerCBs($cTag) [self] {*}$consumerCBArgs]]
 			} elseif {$lastBasicMethod eq "get"} {
 				after idle [list after 0 [list my callback basicDeliver {*}$consumerCBArgs]]
 			} elseif {$lastBasicMethod eq "return"} {

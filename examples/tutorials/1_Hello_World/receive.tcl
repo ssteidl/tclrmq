@@ -1,23 +1,29 @@
+# -*- tab-width: 4; indent-tabs-mode: nil; -*-
 package require rmq
 
-proc create_channel {conn} {
+#Notice we have the extra_context as an extra
+#parameter to the callback.
+proc create_channel {extra_context conn} {
+    puts "Extra context: $extra_context"
     set rChan [::rmq::Channel new $conn]
 
     $rChan queueDeclare "hello"
 
     set consumeFlags [list $::rmq::CONSUME_NO_ACK]
-    $rChan basicConsume callback "hello" $consumeFlags
+
+    #Use a lambda to handle the message
+    $rChan basicConsume {apply {{rChan methodD frameD msg} {
+	puts " \[x\] Received $msg"
+    }}} "hello" $consumeFlags
 
     puts " \[*\] Waiting for messages. To exit press CTRL+C"
 }
 
-proc callback {rChan methodD frameD msg} {
-    puts " \[x\] Received $msg"
-}
+set conn [::rmq::Connection new -debug 1]
 
-set conn [::rmq::Connection new]
+#Set a callback with added context.
+$conn onConnected [list create_channel {tclrmq is awesome}]
 $conn connect
-$conn onConnected create_channel
 
 vwait ::die
 

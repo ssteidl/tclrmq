@@ -913,7 +913,7 @@ oo::define ::rmq::Connection {
 
 		# call user supplied callback for when a connection is established
 		if {$connectedCB ne ""} {
-			$connectedCB [self]
+		        {*}$connectedCB [self]
 		}
 	}
 
