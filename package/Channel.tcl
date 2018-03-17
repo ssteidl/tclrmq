@@ -1,4 +1,4 @@
-package provide rmq 1.3.2
+package provide rmq 1.3.5
 
 package require TclOO
 
@@ -28,7 +28,6 @@ oo::class create ::rmq::Channel {
 	# whether the channel is in confirm mode
 	# and, if so, the publish number of the next message
 	variable confirmMode
-	variable publishNumber
 
 	# can set a callback for when the channel is open or closed
 	# or when the channel receives an error code
@@ -100,7 +99,7 @@ oo::class create ::rmq::Channel {
 		set closing 0
 
 		if {$closedCB ne ""} {
-			$closedCB [self] $closeD
+			{*}$closedCB [self] $closeD
 		}
 	}
 
@@ -114,7 +113,7 @@ oo::class create ::rmq::Channel {
 
 	method callback {methodName args} {
 		if {[dict exists $callbacksD $methodName]} {
-			[dict get $callbacksD $methodName] [self] {*}$args
+			{*}[dict get $callbacksD $methodName] [self] {*}$args
 		}
 	}
 
@@ -149,7 +148,12 @@ oo::class create ::rmq::Channel {
 			if {$lastBasicMethod eq "deliver"} {
 				::rmq::debug "Invoking expanded callback"    
 				set cTag [dict get [lindex $consumerCBArgs 0] consumerTag]
-				after idle [list after 0 [list {*}$consumerCBs($cTag) [self] {*}$consumerCBArgs]]
+
+				if {[info exists consumerCBs($cTag)]} {
+					after idle [list after 0 [list {*}$consumerCBs($cTag) [self] {*}$consumerCBArgs]]
+				} else {
+					::rmq::debug "Delivered message for consumer tag $cTag, but no callback set"
+				}
 			} elseif {$lastBasicMethod eq "get"} {
 				after idle [list after 0 [list my callback basicDeliver {*}$consumerCBArgs]]
 			} elseif {$lastBasicMethod eq "return"} {
@@ -171,7 +175,7 @@ oo::class create ::rmq::Channel {
 		::rmq::debug "Channel error handler with code $errorCode and data $data"
 
 		if {$errorCB ne ""} {
-			$errorCB [self] $errorCode $data
+			{*}$errorCB [self] $errorCode $data
 		}
 	}
 
@@ -327,7 +331,7 @@ oo::define ::rmq::Channel {
 		set active 1
 
 		if {$openCB ne ""} {
-			$openCB [self]
+			{*}$openCB [self]
 		}
 	}
 
@@ -392,7 +396,7 @@ oo::define ::rmq::Channel {
 		::rmq::debug "Channel $num Exchange.BindOk"
 
 		# nothing really passed into this method
-		my callback exchangeBindOk ""
+		my callback exchangeBindOk
 	}
 
 	method exchangeDeclare {eName eType {eFlags ""} {eArgs ""}} {
@@ -429,10 +433,7 @@ oo::define ::rmq::Channel {
 	method exchangeDeclareOk {data} {
 		::rmq::debug "Channel $num Exchange.DeclareOk"
 
-		set eDeclareCB [my getCallback exchangeDeclareOk]
-		if {$eDeclareCB ne ""} {
-			$eDeclareCB [self]
-		}
+		my callback exchangeDeclareOk 
 	}
 
 	method exchangeDelete {eName {inUse 0} {noWait 0}} {
@@ -468,10 +469,7 @@ oo::define ::rmq::Channel {
 	method exchangeDeleteOk {data} {
 		::rmq::debug "Channel $num Exchange.DeleteOk"
 
-		set eDeleteCB [my getCallback exchangeDeleteOk]
-		if {$eDeleteCB ne ""} {
-			$eDeleteCB [self]
-		}
+		my callback exchangeDeleteOk
 	}
 
 	method exchangeUnbind {dst src rKey {noWait 0} {eArgs ""}} {
@@ -550,10 +548,7 @@ oo::define ::rmq::Channel {
 		::rmq::debug "Queue.BindOk"
 
 		# No parameters included
-		set qBindCB [my getCallback queueBindOk]
-		if {$qBindCB ne ""} {
-			$qBindCB [self]
-		}
+		my callback queueBindOk
 	}
 
 	method queueDeclare {qName {qFlags ""} {qArgs ""}} {
@@ -597,10 +592,7 @@ oo::define ::rmq::Channel {
 
 		::rmq::debug "Queue.DeclareOk (name $qName) (msgs $msgCount) (consumers $consumers)"
 
-		set qDeclareCB [my getCallback queueDeclareOk]
-		if {$qDeclareCB ne ""} {
-			$qDeclareCB [self] $qName $msgCount $consumers
-		}
+		my callback queueDeclareOk $qName $msgCount $consumers
 	}
 
 	method queueDelete {qName {flags ""}} {
@@ -630,10 +622,7 @@ oo::define ::rmq::Channel {
 
 		set msgCount [::rmq::dec_ulong $data _]
 
-		set qDeleteCB [my getCallback queueDeleteOk]
-		if {$qDeleteCB ne ""} {
-			$qDeleteCB [self] $msgCount
-		}
+		my callback queueDeleteOk $msgCount
 	}
 
 	method queuePurge {qName {noWait 0}} {
@@ -662,10 +651,7 @@ oo::define ::rmq::Channel {
 
 		set msgCount [::rmq::dec_ulong $data _]
 
-		set qPurgeCB [my getCallback queuePurgeOk]
-		if {$qPurgeCB ne ""} {
-			$qPurgeCB [self] $msgCount
-		}
+		my callback queuePurgeOk $msgCount
 	}
 
 	method queueUnbind {qName eName rKey {qArgs ""}} {
@@ -700,10 +686,7 @@ oo::define ::rmq::Channel {
 		::rmq::debug "Queue.UnbindOk"
 
 		# No parameters included
-		set qUnbindCB [my getCallback queueUnbindOk]
-		if {$qUnbindCB ne ""} {
-			$qUnbindCB [self]
-		}
+		my callback queueUnbindOk
 	}
 }
 
@@ -735,20 +718,9 @@ oo::define ::rmq::Channel {
 	method basicAckReceived {data} {
 		set deliveryTag [::rmq::dec_ulong_long $data bytes]
 		set multiple [::rmq::dec_byte [string range $data $bytes end] _]
+
 		::rmq::debug "Basic.Ack received for $deliveryTag with multiple ($multiple)"
-
-		if {$multiple} {
-			set publishNumber [expr {$deliveryTag + 1}]
-		} elseif {$publishNumber == $deliveryTag} {
-			incr publishNumber
-		} else {
-			::rmq::debug "Basic.Ack received for $deliveryTag but expecting $publishNumber"
-		}
-
-		set bAckCB [my getCallback basicAck]
-		if {$bAckCB ne ""} {
-			$bAckCB [self] $deliveryTag $multiple
-		}
+		my callback basicAck $deliveryTag $multiple
 	}
 
 	method basicConsume {callback qName {cTag ""} {cFlags ""} {cArgs ""}} {
@@ -782,16 +754,13 @@ oo::define ::rmq::Channel {
 		::rmq::debug "Basic.ConsumeOk (consumer tag: $cTag)"
 
 		# if just learned the consumer tag, update callbacks array
-		if {[info exists consumerCBs("")]} {
-			::rmq::debug "With server generated consumer tag, unsetting empty callback key"	
-			set consumerCBs($cTag) $consumerCBs("")
-			unset consumerCBs("")
+		if {[info exists consumerCBs()]} {
+			::rmq::debug "Have server generated consumer tag, unsetting empty callback key"	
+			set consumerCBs($cTag) $consumerCBs()
+			unset consumerCBs()
 		}
 
-		set bConsumeCB [my getCallback basicConsumeOk]
-		if {$bConsumeCB ne ""} {
-			$bConsumeCB [self] $cTag
-		}
+		my callback basicConsumeOk $cTag
 	}
 
 	method basicCancel {cTag {noWait 0}} {
@@ -811,10 +780,7 @@ oo::define ::rmq::Channel {
 
 		set cTag [::rmq::dec_short_string $data _]
 
-		set bCancelCB [my getCallback basicCancelOk]
-		if {$bCancelCB ne ""} {
-			$bCancelCB [self] $cTag
-		}
+		my callback basicCancelOk $cTag
 	}
 
 	method basicCancelRecv {data} {
@@ -824,10 +790,7 @@ oo::define ::rmq::Channel {
 
 		array unset consumerCBs $cTag
 
-		set bCancelCB [my getCallback basicCancel]
-		if {$bCancelCB ne ""} {
-			$bCancelCB [self] $cTag
-		}
+		my callback basicCancel $cTag
 	}
 
 	method basicDeliver {data} {
@@ -955,20 +918,14 @@ oo::define ::rmq::Channel {
 		# there is also a requeue bit in the data but the spec says
 		# "Clients receiving the Nack methods should ignore this flag."
 
-		set bNackCB [my getCallback basicNack]
-		if {$bNackCB ne ""} {
-			$bNackCB [self] $deliveryTag $multiple
-		}
+		my callback basicNack $deliveryTag $multiple
 	}
 
 	method basicQosOk {data} {
 		::rmq::debug "Basic.QosOk"
 
 		# no parameters included
-		set bQosCB [my getCallback basicQosOk]
-		if {$bQosCB ne ""} {
-			$bQosCB [self]
-		}
+		my callback basicQosOk
 	}
 
 	method basicPublish {data eName rKey {pFlags ""} {props ""}} {
@@ -1029,10 +986,7 @@ oo::define ::rmq::Channel {
 		::rmq::debug "Basic.RecoverOk"
 
 		# no parameters
-		set bRecoverCB [my getCallback basicRecoverOk]
-		if {$bRecoverCB ne ""} {
-			$bRecoverCB [self]
-		}
+		my callback basicRecoverOk
 	}
 
 	method basicReject {deliveryTag {reQueue 0}} {
@@ -1087,12 +1041,8 @@ oo::define ::rmq::Channel {
 	method confirmSelectOk {data} {
 		::rmq::debug "Confirm.SelectOk (now in confirm mode)"
 		set confirmMode 1
-		set publishNumber 1
 
-		set cSelectCB [my getCallback confirmSelectOk]
-		if {$cSelectCB ne ""} {
-			$cSelectCB [self]
-		}
+		my callback confirmSelectOk
 	}
 }
 
@@ -1116,10 +1066,7 @@ oo::define ::rmq::Channel {
 		::rmq::debug "Tx.SelectOk"
 
 		# no parameters
-		set tSelectCB [my getCallback txSelectOk]
-		if {$tSelectCB ne ""} {
-			$tSelectCB [self]
-		}
+		my callback txSelectOk
 	}
 
 	method txCommit {} {
@@ -1136,10 +1083,7 @@ oo::define ::rmq::Channel {
 		::rmq::debug "Tx.CommitOk"
 
 		# no parameters
-		set tCommitCB [my getCallback txCommitOk]
-		if {$tCommitCB ne ""} {
-			$tCommitCB [self]
-		}
+		my callback txCommitOk
 	}
 
 	method txRollback {} {
@@ -1156,10 +1100,7 @@ oo::define ::rmq::Channel {
 		::rmq::debug "Tx.RollbackOk"
 
 		# no parameters
-		set tRollbackCB [my getCallback txRollbackOk]
-		if {$tRollbackCB ne ""} {
-			$tRollbackCB [self]
-		}
+		my callback txRollbackOk
 	}
 }
 

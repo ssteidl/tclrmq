@@ -1,4 +1,4 @@
-package provide rmq 1.3.2
+package provide rmq 1.3.5
 
 package require TclOO
 package require tls
@@ -13,9 +13,9 @@ namespace eval rmq {
 		}
 	}
 
-	# return random integer in [start, end]	
+	# return random integer in [start, end]
 	proc rand_int {start end} {
-		set range [expr {$start - $end + 1}]
+		set range [expr {$end - $start + 1}]
 		return [expr {$start + int(rand() * $range)}]
 	}
 }
@@ -39,9 +39,9 @@ oo::class create ::rmq::Connection {
 	# this is set to true after performing the handshake
 	variable connected
 
-	#maximum connect timeout.
+	# max timeout in secs for obtaining socket connection
 	variable maxTimeout
-	
+
 	# whether the connection is blocked
 	variable blocked
 
@@ -94,7 +94,7 @@ oo::class create ::rmq::Connection {
 	# Whether to use TLS for the socket connection
 	variable tls
 	variable tlsOpts
-	
+
 	# Whether to try and auto-reconnect when connection forcibly
 	# closed by the remote side or the network
 	# Maximum number of exponential backoff attempts to try
@@ -169,7 +169,7 @@ oo::class create ::rmq::Connection {
 
 		# if doing periodic socket polling
 		set sockHealthPollingID ""
-		
+
 		# whether we are attempting to reconnect
 		set reconnecting 0
 
@@ -218,8 +218,9 @@ oo::class create ::rmq::Connection {
 		}
 
 		::rmq::debug "Unable to successfully reconnect, not attempting any more..."
+		set reconnecting 0
 		if {$failedReconnectCB ne ""} {
-			$failedReconnectCB [self]
+			{*}$failedReconnectCB [self]
 		}
 	}
 
@@ -229,7 +230,7 @@ oo::class create ::rmq::Connection {
 	#
 	method checkConnection {} {
 		try {
-			eof $sock
+			chan eof $sock
 			set sockHealthPollingID \
 				[after $::rmq::CHECK_CONNECTION [list [self] checkConnection]]
 		} on error {result options} {
@@ -244,7 +245,7 @@ oo::class create ::rmq::Connection {
 	method closeConnection {{callCloseCB 1}} {
 		::rmq::debug "Closing connection"
 		try {
-			fileevent $sock readable ""
+			chan event $sock readable ""
 			close $sock
 		} on error {result options} {
 			::rmq::debug "Close connection error: '$result'"
@@ -264,7 +265,7 @@ oo::class create ::rmq::Connection {
 		# but not every subsequent one
 		# then, if reconnects fail, a separate callback is used
 		if {$closedCB ne "" && $callCloseCB && !$reconnecting} {
-			$closedCB [self] $closeD
+			{*}$closedCB [self] $closeD
 		}
 
 		# time to try an auto reconnect is configured to do so
@@ -283,6 +284,7 @@ oo::class create ::rmq::Connection {
 	method connect {} {
 		# create the socket and configure accordingly
 		try {
+			set connected 0
 			if {!$tls} {
 				set sock [socket -async $host $port]
 			} else {
@@ -291,7 +293,7 @@ oo::class create ::rmq::Connection {
 			}
 
 			# configure the socket
-			fconfigure $sock \
+			chan configure $sock \
 				-blocking 0 \
 				-buffering none \
 				-encoding binary \
@@ -300,52 +302,58 @@ oo::class create ::rmq::Connection {
 			# since we connected using -async, need to wait for a possible timeout
 			# once the socket is connected the writable event will fire and we move on
 			# otherwise we use after to trigger a forceful cancel of the connection
-			fileevent $sock writable [list set ::rmq::connectTimeout 1]
+			chan event $sock writable [list set ::rmq::connectTimeout 0]
 			set timeoutID [after [expr {$maxTimeout * 1000}] \
 								 [list set ::rmq::connectTimeout 1]]
 			vwait ::rmq::connectTimeout
 
+			# get rid of connection timeout state
+			chan event $sock writable ""
+			after cancel $timeoutID
+
 			# potentially reconnect after a timeout
 			# otherwise, unset the writable handler, cancel the timeout check
-			# fconfigure the socket, and move on with something useful
-			if {[fconfigure $sock -connecting]} {
+			# and move on with something useful
+			if {$::rmq::connectTimeout && [chan configure $sock -connecting]} {
+				::rmq::debug "Connection timed out connecting to $host:$port"
+
 				my closeConnection
-				set err [fconfigure $sock -error]
-				::rmq::debug "Connection timed out (-error $err) connecting to $host:$port"
 				if {$autoReconnect && !$reconnecting} {
 					after idle [after 0 [list [self] attemptReconnect]]
 				}
 				return 0
-			} else {
-				# we're connected, no need to detect timeout 
-				fileevent $sock writable ""
-				after cancel $timeoutID
+			} elseif {[set sockErr [chan configure $sock -error]] ne ""} {
+				::rmq::debug "Connection socket error: $sockErr"
+				my closeConnection
+				if {$autoReconnect && !$reconnecting} {
+					after idle [after 0 [list [self] attemptReconnect]]
+				}
+				return 0
 			}
+
+			# setup a readable callback for parsing rmq data
+			chan event $sock readable [list [self] readFrame]
+
+			# periodically monitor for connection status if heartbeats
+			# disabled
+			if {$heartbeatSecs == 0} {
+				set sockHealthPollingID \
+					[after $::rmq::CHECK_CONNECTION [list [self] checkConnection]]
+			}
+
+			# send the protocol header
+			my send [::rmq::enc_protocol_header]
+			::rmq::debug "Sent protocol header"
+
+			# return success (although connection not ready for use
+			# until receive connection.open-ok AMQP method)
+			return 1
 		} on error {result options} {
 			# when using -async this is reached when a DNS lookup fails
 			::rmq::debug "Error connecting to $host:$port '$result'"
 			my closeConnection
 			return 0
 		}
-
-		# mark the object variables for connection status
-		set connected 1
-
-		# setup a readable callback for parsing rmq data
-		fileevent $sock readable [list [self] readFrame]
-
-		# periodically monitor for connection status if heartbeats
-		# disabled
-		if {$heartbeatSecs == 0} {
-			set sockHealthPollingID \
-				[after $::rmq::CHECK_CONNECTION [list [self] checkConnection]]
-		}
-
-		# send the protocol header
-		my send [::rmq::enc_protocol_header]
-		::rmq::debug "Sent protocol header"
-
-		return 1
 	}
 
 	method connected? {} {
@@ -491,8 +499,10 @@ oo::class create ::rmq::Connection {
 	method processFrameSafe {data} {
 		try {
 			my processFrame $data
+			return 1
 		} on error {result options} {
 			::rmq::debug "processFrame error: $result $options"
+			return 0
 		}
 	}
 
@@ -547,7 +557,7 @@ oo::class create ::rmq::Connection {
 			# decide whether the channel needs to be closed or not
 			if {$channelObj eq ""} {
 				if {$errorCB ne ""} {
-					$errorCB [self] $ftype $data
+					{*}$errorCB [self] $ftype $data
 				}
 			} else {
 				$channelObj errorHandler $ftype $data
@@ -561,19 +571,18 @@ oo::class create ::rmq::Connection {
 	}
 
 	#
-	# fileevent readable handler for the socket connection to the
+	# readable handler for the socket connection to the
 	# RabbitMQ server
 	#
 	method readFrame {} {
-		if {[eof $sock]} {
-			::rmq::debug "Reached EOF reading from socket"
-			return [my closeConnection]
-		}
-
 		try {
-			set data [read $sock $frameMax]
+			set data [chan read $sock $frameMax]
+			if {$data eq "" && [chan eof $sock]} {
+				::rmq::debug "Reached EOF reading from socket"
+				return [my closeConnection]
+			}
 		} on error {result options} {
-			::rmq::debug "Error reading from socket"
+			::rmq::debug "Error reading from socket '$result'"
 			return [my closeConnection]
 		}
 
@@ -583,7 +592,9 @@ oo::class create ::rmq::Connection {
 
 			# process frames
 			foreach frame [my splitFrames $data] {
-				my processFrameSafe $frame
+				if {![my processFrameSafe $frame]} {
+					break
+				}
 			}
 		}
 	}
@@ -603,7 +614,7 @@ oo::class create ::rmq::Connection {
 		if {!$channelsToo} {
 			return
 		}
-	
+
 		foreach chanObj [dict values $channelsD] {
 			$chanObj removeCallbacks
 		}
@@ -658,7 +669,7 @@ oo::class create ::rmq::Connection {
 		# need to check if we'd be over the heartbeat interval at the end of the
 		# after wait if we did not send a heartbeat right now
 		if {max($sinceLastRead, $sinceLastSend) >= $heartbeatSecs >> 1} {
-			::rmq::debug "Sending heartbeat frame: long enough since last send or last read" 
+			::rmq::debug "Sending heartbeat frame: long enough since last send or last read"
 			return [my send [::rmq::enc_frame $::rmq::FRAME_HEARTBEAT 0 ""]]
 		}
 
@@ -792,7 +803,7 @@ oo::define ::rmq::Connection {
 
 		set valueType [::rmq::enc_field_value boolean]
 		set value [::rmq::enc_byte 1]
-	
+
 		# connection.blocked (indicates we support connection.blocked methods)
 		if {$blockedConnections} {
 			dict set capabilities connection.blocked "${valueType}${value}"
@@ -911,9 +922,10 @@ oo::define ::rmq::Connection {
 
 		::rmq::debug "Connection.OpenOk: connection now established"
 
-		# call user supplied callback for when a connection is established
+		# call user supplied callback for when Connection is ready for use
 		if {$connectedCB ne ""} {
-		        {*}$connectedCB [self]
+
+			{*}$connectedCB [self]
 		}
 	}
 
@@ -950,7 +962,7 @@ oo::define ::rmq::Connection {
 
 	method connectionCloseOk {data} {
 		::rmq::debug "Connection.CloseOk"
-		my closeConnection 
+		my closeConnection
 	}
 
 	method sendConnectionCloseOk {} {
@@ -967,7 +979,7 @@ oo::define ::rmq::Connection {
 		set blocked 1
 		set reason [::rmq::dec_short_string $data _]
 		if {$BlockedCB ne ""} {
-			$blockedCB [self] $blocked $reason
+			{*}$blockedCB [self] $blocked $reason
 		}
 	}
 
@@ -976,7 +988,7 @@ oo::define ::rmq::Connection {
 
 		set blocked 0
 		if {$blockedCB ne ""} {
-			$blockedCB [self] $blocked ""
+			{*}$blockedCB [self] $blocked ""
 		}
 	}
 }
